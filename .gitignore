@@ -1,0 +1,8 @@
+# Go build artifacts
+*.test
+*.out
+
+# OS / editor cruft
+.DS_Store
+.claude/
+.cursor/
