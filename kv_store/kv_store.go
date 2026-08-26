@@ -23,7 +23,7 @@ type KVServer struct {
 
 	data    map[string]string //the actual key-value store. This is the state machine
 	lastSeq map[int64]int
-	waiters map[int]chan Op
+	waiters map[int]chan applyResult
 }
 
 type PutAppendArgs struct {
@@ -49,12 +49,18 @@ type GetReply struct {
 	Value string
 }
 
+type applyResult struct {
+	ClientId int64
+	SeqNum   int
+	Value    string //the value read for Get
+}
+
 func StartKVServer(peer []*raft.Raft, me int, persister *raft.Persister) *KVServer {
 	kv := &KVServer{
 		applyCh: make(chan raft.ApplyMsg, 1000),
 		data:    make(map[string]string),
 		lastSeq: make(map[int64]int),
-		waiters: make(map[int]chan Op),
+		waiters: make(map[int]chan applyResult),
 	}
 	kv.rf = raft.Make(peer, me, persister, kv.applyCh)
 	go kv.applyloop()
@@ -85,9 +91,15 @@ func (kv *KVServer) applyloop() {
 		}
 
 		//waking the waiters
+		result := applyResult{
+			ClientId: op.ClientId,
+			SeqNum:   op.SeqNum,
+			Value:    kv.data[op.Key],
+		}
+
 		ch, waiting := kv.waiters[msg.CommandIndex]
 		if waiting {
-			ch <- op
+			ch <- result
 			delete(kv.waiters, msg.CommandIndex)
 		}
 		kv.mu.Unlock()
@@ -109,7 +121,7 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	}
 	// register a channel to be notified when this index is applied
 	kv.mu.Lock()
-	ch := make(chan Op, 1)
+	ch := make(chan applyResult, 1)
 	kv.waiters[index] = ch
 	kv.mu.Unlock()
 
@@ -127,4 +139,41 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	kv.mu.Lock()
 	delete(kv.waiters, index)
 	kv.mu.Unlock()
+}
+
+func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
+	op := Op{
+		Type:     "Get",
+		Key:      args.Key,
+		ClientId: args.ClientId,
+		SeqNum:   args.SeqNum,
+	}
+	index, _, is_Leader := kv.rf.Start(op)
+	if !is_Leader {
+		reply.Err = "ErrWrongLeader"
+		return
+	}
+
+	// same as in PutAppend, register a ch in waiters to be waken up later
+	kv.mu.Lock()
+	ch := make(chan applyResult, 1)
+	kv.waiters[index] = ch
+	kv.mu.Unlock()
+
+	select {
+	case result := <-ch:
+		if result.ClientId == op.ClientId && result.SeqNum == op.SeqNum {
+			reply.Err = "OK"
+			reply.Value = result.Value
+		} else {
+			reply.Err = "ErrWrongLeader"
+		}
+	case <-time.After(500 * time.Millisecond):
+		reply.Err = "ErrWrongLeader"
+	}
+
+	kv.mu.Lock()
+	delete(kv.waiters, index)
+	kv.mu.Unlock()
+
 }
