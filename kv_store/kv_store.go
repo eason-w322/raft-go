@@ -3,6 +3,7 @@ package kvstore
 import (
 	"raftgo/raft"
 	"sync"
+	"time"
 )
 
 // Op is client operation
@@ -23,6 +24,29 @@ type KVServer struct {
 	data    map[string]string //the actual key-value store. This is the state machine
 	lastSeq map[int64]int
 	waiters map[int]chan Op
+}
+
+type PutAppendArgs struct {
+	Key      string
+	Value    string
+	Op       string // "put" or "append"
+	ClientId int64
+	SeqNum   int
+}
+
+type PutAppendReply struct {
+	Err string // "OK" or "ErrWrongLeader"
+}
+
+type GetArgs struct {
+	Key      string
+	ClientId int64
+	SeqNum   int
+}
+
+type GetReply struct {
+	Err   string // "OK" or "ErrWrongLeader"
+	Value string
 }
 
 func StartKVServer(peer []*raft.Raft, me int, persister *raft.Persister) *KVServer {
@@ -68,4 +92,39 @@ func (kv *KVServer) applyloop() {
 		}
 		kv.mu.Unlock()
 	}
+}
+
+func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
+	op := Op{
+		Type:     args.Op,
+		Key:      args.Key,
+		Value:    args.Value,
+		ClientId: args.ClientId,
+		SeqNum:   args.SeqNum,
+	}
+	index, _, isLeader := kv.rf.Start(op)
+	if !isLeader {
+		reply.Err = "ErrWrongLeader"
+		return
+	}
+	// register a channel to be notified when this index is applied
+	kv.mu.Lock()
+	ch := make(chan Op, 1)
+	kv.waiters[index] = ch
+	kv.mu.Unlock()
+
+	// Block until the apply loop applies our op (or we give up).
+	select {
+	case appliedOp := <-ch:
+		if appliedOp.ClientId == op.ClientId && appliedOp.SeqNum == op.SeqNum {
+			reply.Err = "OK"
+		} else {
+			reply.Err = "ErrWrongLeader"
+		}
+	case <-time.After(500 * time.Millisecond):
+		reply.Err = "ErrWrongLeader" // timed out; probably lost leadership
+	}
+	kv.mu.Lock()
+	delete(kv.waiters, index)
+	kv.mu.Unlock()
 }
