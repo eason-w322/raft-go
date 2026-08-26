@@ -1,1 +1,1 @@
-package kvstore
+package kvstor
