@@ -1,25 +1,12 @@
 package kvstore
 
 import (
-	"raftgo/raft"
 	"testing"
 	"time"
 )
 
-// makeKVCluster spins up n KV servers, each on its own Raft, wired as peers,
-// plus a Clerk to drive them.
 func makeKVCluster(n int) ([]*KVServer, *Clerk) {
-	peers := make([]*raft.Raft, n)
-	kvs := make([]*KVServer, n)
-	for i := 0; i < n; i++ {
-		kvs[i] = StartKVServer(peers, i, raft.MakePersister())
-		peers[i] = kvs[i].rf
-	}
-	// Every peer is published before any goroutine can read the slice.
-	for i := 0; i < n; i++ {
-		kvs[i].Run()
-	}
-	return kvs, MakeClerk(kvs)
+	return MakeKVCluster(n)
 }
 
 func TestKVBasic(t *testing.T) {

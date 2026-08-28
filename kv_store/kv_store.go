@@ -187,3 +187,24 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	kv.mu.Unlock()
 
 }
+
+func (kv *KVServer) Raft() *raft.Raft {
+	return kv.rf
+}
+
+// MakeKVCluster spins up n KV servers, each on its own Raft, wired as peers,
+// plus a Clerk to drive them. Construction is two-phase on purpose: every
+// entry of the shared peer slice must be published before any background
+// goroutine can read it.
+func MakeKVCluster(n int) ([]*KVServer, *Clerk) {
+	peers := make([]*raft.Raft, n)
+	kvs := make([]*KVServer, n)
+	for i := 0; i < n; i++ {
+		kvs[i] = StartKVServer(peers, i, raft.MakePersister())
+		peers[i] = kvs[i].rf
+	}
+	for i := 0; i < n; i++ {
+		kvs[i].Run()
+	}
+	return kvs, MakeClerk(kvs)
+}
