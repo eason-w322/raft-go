@@ -1,6 +1,7 @@
 package raft
 
 import (
+	"sync"
 	"testing"
 	"time"
 )
@@ -25,6 +26,7 @@ func makeCluster(n int) ([]*Raft, []chan ApplyMsg) {
 			applyCh:       chans[i],
 			persister:     MakePersister(), // each server has its own durable store
 		}
+		peers[i].applyCond = sync.NewCond(&peers[i].mu)
 	}
 	for i := 0; i < n; i++ {
 		go peers[i].ticker()
@@ -102,7 +104,7 @@ func TestBackfillAfterReconnect(t *testing.T) {
 
 	// Disconnect one follower.
 	follower := (leader + 1) % n
-	peers[follower].disconnect()
+	peers[follower].Disconnect()
 	t.Logf("disconnected server %d (leader is %d)", follower, leader)
 
 	// Submit commands while the follower is offline; the majority commits them.
@@ -115,7 +117,7 @@ func TestBackfillAfterReconnect(t *testing.T) {
 	time.Sleep(1 * time.Second)
 
 	// Reconnect — backtracking should backfill the missing entries.
-	peers[follower].reconnect()
+	peers[follower].Reconnect()
 	t.Logf("reconnected server %d", follower)
 	time.Sleep(2 * time.Second)
 
@@ -155,7 +157,7 @@ func TestLeaderFailover(t *testing.T) {
 	t.Logf("leader %d committed; log length %d", leader1, committedLen)
 
 	// Kill the leader.
-	peers[leader1].disconnect()
+	peers[leader1].Disconnect()
 	t.Logf("disconnected leader %d", leader1)
 
 	// A new leader should emerge among the remaining servers.
@@ -205,6 +207,10 @@ func makeClusterWithPersisters(n int) ([]*Raft, []chan ApplyMsg, []*Persister) {
 	for i := 0; i < n; i++ {
 		peers[i] = Make(peers, i, persisters[i], chans[i])
 	}
+	// Only start ticking once every peer is published.
+	for i := 0; i < n; i++ {
+		peers[i].Run()
+	}
 	return peers, chans, persisters
 }
 
@@ -234,11 +240,12 @@ func TestPersistenceRestart(t *testing.T) {
 	// CRASH a follower: throw away its Raft object entirely, then rebuild
 	// it from the SAME persister — simulating a process death + restart.
 	victim := (leader + 1) % n
-	peers[victim].disconnect() // stop the old incarnation from acting
+	peers[victim].Disconnect() // stop the old incarnation from acting
 	newChan := make(chan ApplyMsg, 1000)
 	restarted := Make(peers, victim, persisters[victim], newChan)
 	peers[victim] = restarted // replace with the reborn server
 	chans[victim] = newChan
+	restarted.Run()
 	t.Logf("crashed and restarted server %d", victim)
 
 	// The restarted server must have recovered its log and term.

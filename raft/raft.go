@@ -37,6 +37,10 @@ type Raft struct {
 	commitIndex int //highest index known to be committed
 	lastApplied int //hieghest index apply to the state machine
 
+	// applyCond is signalled whenever commitIndex advances, so applier wakes
+	// immediately instead of polling. Its Locker is rf.mu.
+	applyCond *sync.Cond
+
 	//volatile state on leader only
 	nextIndex  []int // for each peer, index of next entry to send them
 	matchIndex []int // for each peer, highest index known replicated on them
@@ -87,13 +91,13 @@ func (rf *Raft) readPersist(data []byte) {
 	dec.Decode(&rf.log)
 }
 
-func (rf *Raft) disconnect() {
+func (rf *Raft) Disconnect() {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	rf.disconnected = true
 }
 
-func (rf *Raft) reconnect() {
+func (rf *Raft) Reconnect() {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	rf.disconnected = false
@@ -265,11 +269,19 @@ func Make(peers []*Raft, me int, persister *Persister, applyCh chan ApplyMsg) *R
 		applyCh:       applyCh,
 		persister:     persister,
 	}
+	rf.applyCond = sync.NewCond(&rf.mu)
 	rf.readPersist(persister.Read()) // read persister state
+	return rf
+}
+
+// Run starts the background goroutines. It is deliberately separate from Make:
+// the peers slice is shared by every server, so all of it must be filled in
+// before anything reads it. The `go` statements below are what publish those
+// writes to the new goroutines.
+func (rf *Raft) Run() {
 	go rf.ticker()
 	go rf.heartbeatTicker()
 	go rf.applier()
-	return rf
 }
 
 // when leader sends to follower to replicate entries/ send heartbeats
@@ -342,6 +354,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesRepli
 		} else {
 			rf.commitIndex = lastNew
 		}
+		rf.applyCond.Signal()
 	}
 }
 
@@ -425,6 +438,7 @@ func (rf *Raft) advanceCommit() {
 		}
 		if count > len(rf.peers)/2 {
 			rf.commitIndex = n
+			rf.applyCond.Signal()
 			break
 		}
 
@@ -447,22 +461,28 @@ func (rf *Raft) heartbeatTicker() {
 // submit a new command to the log, returns the index the command will appear at, the current term, and whether this server is the leader
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	rf.mu.Lock()
-	defer rf.mu.Unlock()
-
 	if rf.role != Leader {
-		return -1, rf.currentTerm, false
+		term := rf.currentTerm
+		rf.mu.Unlock()
+		return -1, term, false
 	}
-
 	rf.log = append(rf.log, LogEntry{Term: rf.currentTerm, Command: command})
 	index := len(rf.log) - 1
-	rf.persist() //sixth persist
-	return index, rf.currentTerm, true
+	term := rf.currentTerm
+	rf.persist()
+	rf.mu.Unlock()
+
+	go rf.sendAppendEntries() // replicate now, don't wait for the heartbeat
+	return index, term, true
 }
 
 func (rf *Raft) applier() {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 	for {
-		time.Sleep(10 * time.Millisecond)
-		rf.mu.Lock()
+		for rf.lastApplied >= rf.commitIndex {
+			rf.applyCond.Wait() // releases rf.mu while parked
+		}
 		for rf.lastApplied < rf.commitIndex {
 			rf.lastApplied++
 			msg := ApplyMsg{
@@ -474,6 +494,5 @@ func (rf *Raft) applier() {
 			rf.applyCh <- msg
 			rf.mu.Lock()
 		}
-		rf.mu.Unlock()
 	}
 }

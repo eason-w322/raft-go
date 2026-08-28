@@ -19,7 +19,7 @@ func nrand() int64 {
 	return bigx.Int64()
 }
 
-func makeClerk(servers []*KVServer) *Clerk {
+func MakeClerk(servers []*KVServer) *Clerk {
 	return &Clerk{
 		servers:  servers,
 		clientId: nrand(),

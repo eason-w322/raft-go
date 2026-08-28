@@ -63,8 +63,14 @@ func StartKVServer(peer []*raft.Raft, me int, persister *raft.Persister) *KVServ
 		waiters: make(map[int]chan applyResult),
 	}
 	kv.rf = raft.Make(peer, me, persister, kv.applyCh)
-	go kv.applyloop()
 	return kv
+}
+
+// Run starts this server's apply loop and its Raft. Call it only after every
+// entry of the shared peer slice has been filled in.
+func (kv *KVServer) Run() {
+	go kv.applyloop()
+	kv.rf.Run()
 }
 
 func (kv *KVServer) applyloop() {
@@ -114,13 +120,17 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 		ClientId: args.ClientId,
 		SeqNum:   args.SeqNum,
 	}
+	// Submit and register under one hold of kv.mu. applyloop must take kv.mu
+	// to deliver a result, so it cannot apply this index before the waiter
+	// exists -- otherwise a fast commit lands with nobody listening and the
+	// request eats the full 500ms timeout.
+	kv.mu.Lock()
 	index, _, isLeader := kv.rf.Start(op)
 	if !isLeader {
+		kv.mu.Unlock()
 		reply.Err = "ErrWrongLeader"
 		return
 	}
-	// register a channel to be notified when this index is applied
-	kv.mu.Lock()
 	ch := make(chan applyResult, 1)
 	kv.waiters[index] = ch
 	kv.mu.Unlock()
@@ -148,14 +158,14 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 		ClientId: args.ClientId,
 		SeqNum:   args.SeqNum,
 	}
+	// Same atomic submit-and-register as PutAppend.
+	kv.mu.Lock()
 	index, _, is_Leader := kv.rf.Start(op)
 	if !is_Leader {
+		kv.mu.Unlock()
 		reply.Err = "ErrWrongLeader"
 		return
 	}
-
-	// same as in PutAppend, register a ch in waiters to be waken up later
-	kv.mu.Lock()
 	ch := make(chan applyResult, 1)
 	kv.waiters[index] = ch
 	kv.mu.Unlock()
